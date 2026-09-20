@@ -4,6 +4,7 @@ A C++ terminal application demonstrating advanced Data Structures and Algorithms
 
 ## 🚀 Features
 
+- **Persistent SQL Storage (SQLite3)**: Automatically connects to a local `.db` file, creates tables, and persists users and friendships across sessions.
 - **Friend Recommendations**: Uses a custom weighted algorithm `(Mutual Friends * 2) + (Shared Interests * 1)` to score and recommend potential friends.
 - **Degrees of Separation**: Implements Breadth-First Search (BFS) to find the shortest connection path between any two users in the network.
 - **Community Detection**: Uses Graph Traversal (BFS) to identify isolated, disconnected groups of friends (Connected Components) within the network.
@@ -19,9 +20,9 @@ A C++ terminal application demonstrating advanced Data Structures and Algorithms
 ## 🛠️ How to Run
 
 1. Clone the repository.
-2. Compile the C++ code using a modern compiler (C++17 or higher):
+2. Compile the C++ code using a modern compiler (C++17 or higher) and link the SQLite library:
    ```bash
-   g++ -std=c++17 main.cpp -o friend_suggestion
+   g++ -std=c++17 main.cpp -lsqlite3 -o friend_suggestion
    ```
 3. Run the interactive executable:
    ```bash

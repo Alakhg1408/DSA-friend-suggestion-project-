@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <limits>
+#include <sqlite3.h> // SQLite C++ API
 
 using namespace std;
 
@@ -34,7 +35,6 @@ struct Recommendation {
     int sharedInterests;
     int score;
 
-    // Sort descending by score
     bool operator<(const Recommendation& other) const {
         return score > other.score;
     }
@@ -42,17 +42,24 @@ struct Recommendation {
 
 class SocialGraph {
 private:
-    // Adjacency list: UserID -> Set of Friend UserIDs
     unordered_map<string, unordered_set<string>> adjacencyList;
-    // User Map: UserID -> User Object
     unordered_map<string, User> users;
+    sqlite3* db;
 
-    // Helper function to calculate intersection of two sets
+    // Helper: Execute a SQL command (No return values expected)
+    void executeSQL(const string& sql) {
+        char* errMsg = nullptr;
+        int rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &errMsg);
+        if (rc != SQLITE_OK) {
+            cerr << RED << "SQL Error: " << errMsg << RESET << endl;
+            sqlite3_free(errMsg);
+        }
+    }
+
     int getIntersectionSize(const unordered_set<string>& set1, const unordered_set<string>& set2) const {
         int count = 0;
         const auto& smaller = (set1.size() < set2.size()) ? set1 : set2;
         const auto& larger = (set1.size() < set2.size()) ? set2 : set1;
-
         for (const string& item : smaller) {
             if (larger.find(item) != larger.end()) {
                 count++;
@@ -62,6 +69,73 @@ private:
     }
 
 public:
+    SocialGraph() {
+        // 1. Open Database
+        int rc = sqlite3_open("database.db", &db);
+        if (rc) {
+            cerr << RED << "Cannot open database: " << sqlite3_errmsg(db) << RESET << endl;
+            exit(0);
+        }
+
+        // 2. Initialize Tables
+        executeSQL("CREATE TABLE IF NOT EXISTS Users (id TEXT PRIMARY KEY, name TEXT);");
+        executeSQL("CREATE TABLE IF NOT EXISTS Interests (user_id TEXT, interest TEXT);");
+        executeSQL("CREATE TABLE IF NOT EXISTS Friendships (user1_id TEXT, user2_id TEXT);");
+    }
+
+    ~SocialGraph() {
+        sqlite3_close(db);
+    }
+
+    // -----------------------------------------------------------------
+    // SQL: Load Data from DB into Memory
+    // -----------------------------------------------------------------
+    void loadFromDatabase() {
+        sqlite3_stmt* stmt;
+
+        // Load Users
+        string sqlUsers = "SELECT id, name FROM Users;";
+        if (sqlite3_prepare_v2(db, sqlUsers.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                string id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                string name = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                users[id] = {name, {}};
+                adjacencyList[id] = {};
+            }
+        }
+        sqlite3_finalize(stmt);
+
+        // Load Interests
+        string sqlInterests = "SELECT user_id, interest FROM Interests;";
+        if (sqlite3_prepare_v2(db, sqlInterests.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                string id = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                string interest = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                if (users.find(id) != users.end()) {
+                    users[id].interests.insert(interest);
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+
+        // Load Friendships
+        string sqlFriendships = "SELECT user1_id, user2_id FROM Friendships;";
+        if (sqlite3_prepare_v2(db, sqlFriendships.c_str(), -1, &stmt, nullptr) == SQLITE_OK) {
+            while (sqlite3_step(stmt) == SQLITE_ROW) {
+                string u1 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+                string u2 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+                if (users.find(u1) != users.end() && users.find(u2) != users.end()) {
+                    adjacencyList[u1].insert(u2);
+                    adjacencyList[u2].insert(u1); // Ensure undirected logic
+                }
+            }
+        }
+        sqlite3_finalize(stmt);
+    }
+
+    // -----------------------------------------------------------------
+    // Core Graph Functions (Now with SQL Persistence)
+    // -----------------------------------------------------------------
     void addUser(const string& userId, const string& name, const vector<string>& interests) {
         if (users.find(userId) == users.end()) {
             User newUser;
@@ -71,13 +145,30 @@ public:
             }
             users[userId] = newUser;
             adjacencyList[userId] = unordered_set<string>();
+
+            // Persist User to SQL
+            string sqlUser = "INSERT INTO Users (id, name) VALUES ('" + userId + "', '" + name + "');";
+            executeSQL(sqlUser);
+
+            // Persist Interests to SQL
+            for (const string& interest : interests) {
+                string sqlInterest = "INSERT INTO Interests (user_id, interest) VALUES ('" + userId + "', '" + interest + "');";
+                executeSQL(sqlInterest);
+            }
         }
     }
 
     void addFriendship(const string& user1, const string& user2) {
         if (users.find(user1) != users.end() && users.find(user2) != users.end()) {
-            adjacencyList[user1].insert(user2);
-            adjacencyList[user2].insert(user1);
+            // Check if already friends to prevent duplicate SQL inserts
+            if (adjacencyList[user1].find(user2) == adjacencyList[user1].end()) {
+                adjacencyList[user1].insert(user2);
+                adjacencyList[user2].insert(user1);
+
+                // Persist Friendship to SQL (We just store it one way to save space, load logic handles both)
+                string sql = "INSERT INTO Friendships (user1_id, user2_id) VALUES ('" + user1 + "', '" + user2 + "');";
+                executeSQL(sql);
+            }
         } else {
             cout << RED << "Error: One or both users do not exist!" << RESET << endl;
         }
@@ -93,9 +184,6 @@ public:
         return getIntersectionSize(users.at(user1).interests, users.at(user2).interests);
     }
 
-    // -----------------------------------------------------------------
-    // FEATURE 1: Recommendation Engine
-    // -----------------------------------------------------------------
     vector<Recommendation> getRecommendations(const string& targetUserId) const {
         vector<Recommendation> recommendations;
         if (users.find(targetUserId) == users.end()) return recommendations;
@@ -108,17 +196,13 @@ public:
             const string& otherUserId = pair.first;
             const User& otherUser = pair.second;
 
-            if (otherUserId == targetUserId || targetFriends.find(otherUserId) != targetFriends.end()) {
-                continue;
-            }
+            if (otherUserId == targetUserId || targetFriends.find(otherUserId) != targetFriends.end()) continue;
 
             int mutualFriendsCount = getMutualFriends(targetUserId, otherUserId);
             int sharedInterestsCount = getSharedInterests(targetUserId, otherUserId);
 
             if (mutualFriendsCount > 0 || sharedInterestsCount > 0) {
-                int score = (mutualFriendsCount * MUTUAL_FRIEND_WEIGHT) + 
-                            (sharedInterestsCount * SHARED_INTEREST_WEIGHT);
-
+                int score = (mutualFriendsCount * MUTUAL_FRIEND_WEIGHT) + (sharedInterestsCount * SHARED_INTEREST_WEIGHT);
                 recommendations.push_back({otherUserId, otherUser.name, mutualFriendsCount, sharedInterestsCount, score});
             }
         }
@@ -126,16 +210,12 @@ public:
         return recommendations;
     }
 
-    // -----------------------------------------------------------------
-    // FEATURE 2: Degrees of Separation (Shortest Path via BFS)
-    // -----------------------------------------------------------------
-    // Time Complexity: O(V + E) 
     int getDegreesOfSeparation(const string& startUserId, const string& targetUserId) const {
         if (users.find(startUserId) == users.end() || users.find(targetUserId) == users.end()) return -1;
         if (startUserId == targetUserId) return 0;
 
         unordered_set<string> visited;
-        queue<pair<string, int>> q; // Queue of {userId, distance}
+        queue<pair<string, int>> q;
 
         q.push({startUserId, 0});
         visited.insert(startUserId);
@@ -144,9 +224,7 @@ public:
             auto [currentId, distance] = q.front();
             q.pop();
 
-            if (currentId == targetUserId) {
-                return distance;
-            }
+            if (currentId == targetUserId) return distance;
 
             for (const string& neighbor : adjacencyList.at(currentId)) {
                 if (visited.find(neighbor) == visited.end()) {
@@ -155,13 +233,9 @@ public:
                 }
             }
         }
-        return -1; // Unreachable
+        return -1;
     }
 
-    // -----------------------------------------------------------------
-    // FEATURE 3: Community Detection (Connected Components via BFS)
-    // -----------------------------------------------------------------
-    // Time Complexity: O(V + E)
     vector<vector<string>> getCommunities() const {
         unordered_set<string> visited;
         vector<vector<string>> communities;
@@ -194,7 +268,6 @@ public:
         return communities;
     }
 
-    // --- Helper UI Methods ---
     void displayUsers() const {
         cout << BOLD << "\n--- Available Users ---" << RESET << endl;
         for (const auto& pair : users) {
@@ -209,35 +282,44 @@ public:
     string getUserName(const string& id) const {
         return users.at(id).name;
     }
+    
+    bool isEmpty() const {
+        return users.empty();
+    }
 };
 
 void seedData(SocialGraph& graph) {
-    // Community 1
+    if (!graph.isEmpty()) return; // Prevent re-seeding if DB already has data!
+
     graph.addUser("u1", "Alice", {"Coding", "Music", "Reading"});
     graph.addUser("u2", "Bob", {"Music", "Sports"});
     graph.addUser("u3", "Charlie", {"Coding", "Gaming", "Music"});
     graph.addUser("u4", "David", {"Reading", "Travel"});
     graph.addUser("u5", "Eve", {"Sports", "Gaming", "Coding"});
     graph.addUser("u6", "Frank", {"Travel", "Music", "Reading"});
-
-    graph.addFriendship("u1", "u2"); // Alice - Bob
-    graph.addFriendship("u2", "u3"); // Bob - Charlie
-    graph.addFriendship("u1", "u4"); // Alice - David
-    graph.addFriendship("u3", "u5"); // Charlie - Eve
-    graph.addFriendship("u4", "u6"); // David - Frank
-
-    // Community 2 (Disconnected from Community 1)
     graph.addUser("u7", "Grace", {"Art", "Design"});
     graph.addUser("u8", "Heidi", {"Art", "Photography"});
+
+    graph.addFriendship("u1", "u2"); 
+    graph.addFriendship("u2", "u3"); 
+    graph.addFriendship("u1", "u4"); 
+    graph.addFriendship("u3", "u5"); 
+    graph.addFriendship("u4", "u6"); 
     graph.addFriendship("u7", "u8");
 }
 
 int main() {
     SocialGraph graph;
+    
+    // Load existing data from SQL Database
+    graph.loadFromDatabase();
+    
+    // Seed data only if DB is completely empty (First run)
     seedData(graph);
 
     cout << BOLD << MAGENTA << "===========================================" << RESET << endl;
     cout << BOLD << MAGENTA << "  DSA Friend Suggestion & Network Analysis " << RESET << endl;
+    cout << BOLD << GREEN << "      [SQL DATABASE CONNECTED] " << RESET << endl;
     cout << BOLD << MAGENTA << "===========================================" << RESET << endl;
 
     while (true) {
@@ -245,16 +327,16 @@ int main() {
         cout << CYAN << "1." << RESET << " Get Friend Suggestions" << endl;
         cout << CYAN << "2." << RESET << " Find Degrees of Separation (Shortest Path)" << endl;
         cout << CYAN << "3." << RESET << " View All Communities (Connected Components)" << endl;
-        cout << CYAN << "4." << RESET << " Add New User" << endl;
-        cout << CYAN << "5." << RESET << " Add New Friendship" << endl;
+        cout << CYAN << "4." << RESET << " Add New User (SQL INSERT)" << endl;
+        cout << CYAN << "5." << RESET << " Add New Friendship (SQL INSERT)" << endl;
         cout << CYAN << "6." << RESET << " Exit" << endl;
         cout << BOLD << "Enter your choice: " << RESET;
 
         int choice;
         if (!(cin >> choice)) {
-            cin.clear(); // clear error flags
-            cin.ignore(numeric_limits<streamsize>::max(), '\n'); // ignore invalid input
-            cout << RED << "Invalid input. Please enter a number." << RESET << endl;
+            cin.clear(); 
+            cin.ignore(numeric_limits<streamsize>::max(), '\n'); 
+            cout << RED << "Invalid input." << RESET << endl;
             continue;
         }
 
@@ -290,11 +372,8 @@ int main() {
 
             int dist = graph.getDegreesOfSeparation(u1, u2);
             cout << BOLD << BLUE << "\nDegrees of separation between " << graph.getUserName(u1) << " and " << graph.getUserName(u2) << ":" << RESET << endl;
-            if (dist == -1) {
-                cout << "No connection path exists between them." << endl;
-            } else {
-                cout << dist << " degree(s) of separation." << endl;
-            }
+            if (dist == -1) cout << "No connection path exists between them." << endl;
+            else cout << dist << " degree(s) of separation." << endl;
         } 
         else if (choice == 3) {
             auto communities = graph.getCommunities();
@@ -323,7 +402,7 @@ int main() {
             if (!interestInput.empty()) interests.push_back(interestInput);
 
             graph.addUser(id, name, interests);
-            cout << BOLD << GREEN << "Successfully added user " << name << "!" << RESET << endl;
+            cout << BOLD << GREEN << "Successfully inserted user " << name << " into SQL Database!" << RESET << endl;
         }
         else if (choice == 5) {
             graph.displayUsers();
@@ -337,7 +416,7 @@ int main() {
             }
             
             graph.addFriendship(u1, u2);
-            cout << BOLD << GREEN << "Successfully added friendship between " << graph.getUserName(u1) << " and " << graph.getUserName(u2) << "!" << RESET << endl;
+            cout << BOLD << GREEN << "Successfully inserted friendship between " << graph.getUserName(u1) << " and " << graph.getUserName(u2) << " into SQL Database!" << RESET << endl;
         }
         else if (choice == 6) {
             cout << GREEN << "Exiting. Good luck on your interview!" << RESET << endl;

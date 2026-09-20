@@ -3,3 +3,5 @@ friend_suggestion
 
 # Ignore OS files
 .DS_Store
+
+database.db
