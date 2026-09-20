@@ -1,0 +1,5 @@
+# Ignore compiled executable
+friend_suggestion
+
+# Ignore OS files
+.DS_Store
